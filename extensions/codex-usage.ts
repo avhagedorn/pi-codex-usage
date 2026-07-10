@@ -41,11 +41,8 @@ type UsageSummary = {
 const EXTENSION_VERSION = "0.1.0";
 const STATUS_KEY = "codex-usage";
 const WIDGET_KEY = "codex-usage";
-const AUTO_REFRESH_MIN_MS = 5 * 60 * 1000;
 const APP_SERVER_TIMEOUT_MS = 20_000;
 
-let watchEnabled = false;
-let lastRefreshAt = 0;
 let refreshInFlight: Promise<UsageSummary> | undefined;
 
 export default function codexUsageExtension(pi: ExtensionAPI) {
@@ -53,7 +50,7 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
     description:
       "Show Codex ChatGPT subscription usage windows, remaining percentage, credits, and reset times",
     getArgumentCompletions(prefix: string) {
-      return ["refresh", "status", "watch", "unwatch", "hide", "help"]
+      return ["refresh", "status", "hide", "help"]
         .filter((value) => value.startsWith(prefix.trim().toLowerCase()))
         .map((value) => ({ value, label: value }));
     },
@@ -66,22 +63,8 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
       }
 
       if (["hide", "clear", "off"].includes(action)) {
-        watchEnabled = false;
         clearUsageUi(ctx);
         ctx.ui.notify("Codex usage display hidden", "info");
-        return;
-      }
-
-      if (["watch", "on", "auto"].includes(action)) {
-        watchEnabled = true;
-        await refreshAndRender(pi, ctx, { widget: true, notify: true, status: true }).catch(() => undefined);
-        ctx.ui.notify("Codex usage auto-refresh enabled for this pi session", "info");
-        return;
-      }
-
-      if (["unwatch", "stop", "auto-off"].includes(action)) {
-        watchEnabled = false;
-        ctx.ui.notify("Codex usage auto-refresh disabled", "info");
         return;
       }
 
@@ -117,11 +100,6 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
     if (ctx.hasUI) clearUsageUi(ctx);
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
-    if (!watchEnabled || !ctx.hasUI) return;
-    if (Date.now() - lastRefreshAt < AUTO_REFRESH_MIN_MS) return;
-    await refreshAndRender(pi, ctx, { widget: false, notify: false, status: true }).catch(() => undefined);
-  });
 }
 
 function showHelp(pi: ExtensionAPI, ctx: ExtensionContext) {
@@ -130,8 +108,6 @@ function showHelp(pi: ExtensionAPI, ctx: ExtensionContext) {
     "Codex usage commands",
     "  /codex-usage          refresh and print usage here",
     "  /codex-usage status   refresh compact footer status only",
-    "  /codex-usage watch    refresh after pi turns, at most every 5 minutes",
-    "  /codex-usage unwatch  stop automatic refresh",
     "  /codex-usage hide     clear footer/widget status",
     "",
     "Uses `codex app-server --listen stdio://` and `account/rateLimits/read`.",
@@ -178,8 +154,6 @@ async function refreshAndRender(
     }
     throw error;
   });
-
-  lastRefreshAt = Date.now();
 
   if (ctx.hasUI) {
     if (options.status) ctx.ui.setStatus(STATUS_KEY, summary.statusText);

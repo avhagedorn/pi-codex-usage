@@ -1,0 +1,39 @@
+{
+  "name": "pi-codex-usage",
+  "version": "0.1.0",
+  "description": "A Codex usage extension for pi: shows ChatGPT Codex subscription usage, remaining limits, credits, and reset times.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Alan Hagedorn <avhagedorn@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/avhagedorn/pi-codex-usage.git"
+  },
+  "bugs": {
+    "url": "https://github.com/avhagedorn/pi-codex-usage/issues"
+  },
+  "homepage": "https://github.com/avhagedorn/pi-codex-usage#readme",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "codex",
+    "usage",
+    "terminal"
+  ],
+  "pi": {
+    "extensions": ["./extensions/codex-usage.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

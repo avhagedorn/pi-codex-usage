@@ -5,8 +5,8 @@ A Codex usage extension for [pi](https://pi.dev).
 What it does:
 
 - Shows your current ChatGPT Codex usage windows from the local Codex CLI app-server.
-- Prints a compact transcript card with used/left percentages, reset times, plan, credits, and banked resets.
-- Keeps itself hidden by default; nothing appears until you run a command.
+- Shows a compact usage card above the editor with used/left percentages, reset times, plan, credits, and banked resets.
+- Keeps itself hidden by default; the usage card disappears automatically when you send your next prompt.
 - Can update a compact footer status on demand.
 - Registers a `codex_usage` tool so the agent can answer usage-limit questions directly.
 
@@ -65,7 +65,7 @@ Reload or restart pi after installing:
 ## Commands
 
 ```text
-/codex-usage          # fetch usage and print it into the transcript
+/codex-usage          # fetch usage and show the card above the editor
 /codex-usage status   # fetch usage and show compact footer status only
 /codex-usage hide     # clear footer/widget leftovers
 /codex-usage help     # show command help

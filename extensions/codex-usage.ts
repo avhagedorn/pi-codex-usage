@@ -1,13 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createInterface, type Interface } from "node:readline";
 
 type JsonObject = Record<string, unknown>;
 
 type CodexAppServerMessage = {
   id?: number | string;
-  method?: string;
-  params?: unknown;
   result?: unknown;
   error?: { code?: number; message?: string; data?: unknown };
 };
@@ -19,7 +18,6 @@ type CodexUsageRaw = {
 
 type UsageWindow = {
   label: string;
-  limitName?: string;
   usedPercent: number;
   remainingPercent: number;
   resetsAt?: number;
@@ -38,12 +36,24 @@ type UsageSummary = {
   plan?: string;
 };
 
-const EXTENSION_VERSION = "0.1.0";
+const EXTENSION_VERSION = "0.2.0";
 const STATUS_KEY = "codex-usage";
 const WIDGET_KEY = "codex-usage";
 const APP_SERVER_TIMEOUT_MS = 20_000;
 
+type PendingRequest = {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timeout: NodeJS.Timeout;
+  removeAbortListener?: () => void;
+};
+
+let appServer: CodexAppServerClient | undefined;
+let cachedSummary: UsageSummary | undefined;
 let refreshInFlight: Promise<UsageSummary> | undefined;
+let uiRequestId = 0;
+
+type RefreshView = "widget" | "status";
 
 export default function codexUsageExtension(pi: ExtensionAPI) {
   pi.registerCommand("codex-usage", {
@@ -58,21 +68,34 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
       const action = args.trim().toLowerCase();
 
       if (action === "help" || action === "--help" || action === "-h") {
-        showHelp(pi, ctx);
+        showHelp(ctx);
         return;
       }
 
       if (["hide", "clear", "off"].includes(action)) {
         clearUsageUi(ctx);
-        ctx.ui.notify("Codex usage display hidden", "info");
+        if (ctx.hasUI) ctx.ui.notify("Codex usage display hidden", "info");
         return;
       }
 
-      await refreshAndRender(pi, ctx, {
-        widget: action !== "status",
-        notify: action === "status",
-        status: action === "status",
-      }).catch(() => undefined);
+      const requestId = ++uiRequestId;
+      const view: RefreshView = action === "status" ? "status" : "widget";
+      const cached = cachedSummary;
+
+      if (ctx.hasUI) {
+        if (view === "widget") {
+          ctx.ui.setWidget(WIDGET_KEY, cached?.widgetLines ?? [
+            "Codex usage",
+            "Refreshing…",
+          ]);
+        } else {
+          ctx.ui.setStatus(STATUS_KEY, "Codex usage: refreshing…");
+        }
+      }
+
+      // Render the cached value immediately, then replace it when the refresh
+      // completes. The command no longer waits for app-server startup/network I/O.
+      void refreshAndRender(ctx, { view, requestId }).catch(() => undefined);
     },
   });
 
@@ -97,16 +120,37 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
+    cachedSummary = undefined;
+    refreshInFlight = undefined;
+    uiRequestId = 0;
+    appServer = ctx.hasUI ? new CodexAppServerClient() : undefined;
+    if (ctx.hasUI) clearUsageUi(ctx);
+
+    // Warm the persistent app-server connection in the background. The first
+    // command is then normally served from the cache instead of waiting for
+    // process startup and the rate-limits request.
+    if (ctx.hasUI) void refreshUsage().catch(() => undefined);
+  });
+
+  pi.on("input", (_event, ctx) => {
+    // Usage is a transient view: clear it when the user starts the next prompt.
+    // Bump the request id so an older refresh cannot put the widget back.
     if (ctx.hasUI) clearUsageUi(ctx);
   });
 
+  pi.on("session_shutdown", () => {
+    uiRequestId++;
+    appServer?.close();
+    appServer = undefined;
+    refreshInFlight = undefined;
+  });
 }
 
-function showHelp(pi: ExtensionAPI, ctx: ExtensionContext) {
+function showHelp(ctx: ExtensionContext) {
   if (!ctx.hasUI) return;
-  showTranscript(pi, [
+  ctx.ui.setWidget(WIDGET_KEY, [
     "Codex usage commands",
-    "  /codex-usage          refresh and print usage here",
+    "  /codex-usage          refresh and show usage above the editor",
     "  /codex-usage status   refresh compact footer status only",
     "  /codex-usage hide     clear footer/widget status",
     "",
@@ -116,49 +160,41 @@ function showHelp(pi: ExtensionAPI, ctx: ExtensionContext) {
 }
 
 function clearUsageUi(ctx: ExtensionContext) {
+  uiRequestId++;
   if (!ctx.hasUI) return;
   ctx.ui.setStatus(STATUS_KEY, undefined);
   ctx.ui.setWidget(WIDGET_KEY, undefined);
 }
 
-function showTranscript(pi: ExtensionAPI, lines: string[]): void {
-  pi.sendMessage({
-    customType: "codex-usage",
-    content: lines.join("\n"),
-    display: true,
-  });
-}
-
 async function refreshAndRender(
-  pi: ExtensionAPI,
   ctx: ExtensionContext,
-  options: { widget: boolean; notify: boolean; status: boolean },
+  options: { view: RefreshView; requestId: number },
 ): Promise<UsageSummary> {
-  if (ctx.hasUI && options.status) {
-    ctx.ui.setStatus(STATUS_KEY, "Codex usage: refreshing…");
-  }
-
-  const summary = await refreshUsage(ctx.signal).catch(async (error) => {
+  const summary = await refreshUsage(ctx.signal).catch((error) => {
     const message = friendlyError(error);
-    if (ctx.hasUI) {
-      if (options.status) ctx.ui.setStatus(STATUS_KEY, "Codex usage: unavailable");
-      if (options.widget) {
-        showTranscript(pi, [
+    if (ctx.hasUI && options.requestId === uiRequestId) {
+      if (options.view === "status") {
+        ctx.ui.setStatus(STATUS_KEY, "Codex usage: unavailable");
+        ctx.ui.notify(message, "error");
+      } else {
+        ctx.ui.setWidget(WIDGET_KEY, [
           "Codex usage unavailable",
           message,
           "",
           "Try: `codex login`, then `/codex-usage`.",
         ]);
       }
-      if (options.notify) ctx.ui.notify(message, "error");
     }
     throw error;
   });
 
-  if (ctx.hasUI) {
-    if (options.status) ctx.ui.setStatus(STATUS_KEY, summary.statusText);
-    if (options.widget) showTranscript(pi, summary.widgetLines);
-    if (options.notify && !options.widget) ctx.ui.notify("Codex usage updated", "info");
+  if (ctx.hasUI && options.requestId === uiRequestId) {
+    if (options.view === "status") {
+      ctx.ui.setStatus(STATUS_KEY, summary.statusText);
+      ctx.ui.notify("Codex usage updated", "info");
+    } else {
+      ctx.ui.setWidget(WIDGET_KEY, summary.widgetLines);
+    }
   }
 
   return summary;
@@ -168,6 +204,10 @@ function refreshUsage(signal?: AbortSignal): Promise<UsageSummary> {
   if (!refreshInFlight) {
     refreshInFlight = fetchCodexUsage(signal)
       .then(summarizeUsage)
+      .then((summary) => {
+        cachedSummary = summary;
+        return summary;
+      })
       .finally(() => {
         refreshInFlight = undefined;
       });
@@ -176,11 +216,47 @@ function refreshUsage(signal?: AbortSignal): Promise<UsageSummary> {
 }
 
 function fetchCodexUsage(signal?: AbortSignal): Promise<CodexUsageRaw> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let stdoutBuffer = "";
-    let stderrBuffer = "";
-    let account: unknown;
+  const client = appServer ??= new CodexAppServerClient();
+  return client.readUsage(signal);
+}
+
+class CodexAppServerClient {
+  private child: ChildProcessWithoutNullStreams | undefined;
+  private initPromise: Promise<void> | undefined;
+  private nextRequestId = 1;
+  private output: Interface | undefined;
+  private stderrBuffer = "";
+  private pending = new Map<number, PendingRequest>();
+  private closed = false;
+
+  async readUsage(signal?: AbortSignal): Promise<CodexUsageRaw> {
+    await this.initialize(signal);
+    const [account, response] = await Promise.all([
+      this.request("account/read", { refreshToken: false }, signal),
+      this.request("account/rateLimits/read", {}, signal),
+    ]);
+    return { account, response: asObject(response) ?? {} };
+  }
+
+  close(): void {
+    this.closed = true;
+    const error = new Error("Codex app-server closed");
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timeout);
+      request.removeAbortListener?.();
+      request.reject(error);
+    }
+    this.pending.clear();
+    this.initPromise = undefined;
+    this.output?.close();
+    this.output = undefined;
+    this.child?.kill();
+    this.child = undefined;
+  }
+
+  private initialize(signal?: AbortSignal): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("Codex app-server client is closed"));
+    if (this.child && this.initPromise) return this.initPromise;
 
     const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -189,111 +265,123 @@ function fetchCodexUsage(signal?: AbortSignal): Promise<CodexUsageRaw> {
         RUST_LOG: process.env.RUST_LOG ?? "error",
       },
     });
-
-    const cleanup = () => {
-      signal?.removeEventListener("abort", onAbort);
-      clearTimeout(timeout);
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
-      child.removeAllListeners();
-      if (!child.killed) child.kill();
-    };
-
-    const finish = (error?: Error, value?: CodexUsageRaw) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) reject(error);
-      else resolve(value!);
-    };
-
-    const timeout = setTimeout(() => {
-      finish(new Error(`Timed out after ${APP_SERVER_TIMEOUT_MS / 1000}s waiting for Codex app-server`));
-    }, APP_SERVER_TIMEOUT_MS);
-
-    const onAbort = () => finish(new Error("Cancelled"));
-    signal?.addEventListener("abort", onAbort, { once: true });
-
-    child.on("error", (error) => finish(error));
-    child.on("exit", (code, maybeSignal) => {
-      if (!settled && code !== 0) {
-        finish(
-          new Error(
-            `Codex app-server exited early (${maybeSignal ?? `code ${code}`})${
-              stderrBuffer.trim() ? `: ${stderrBuffer.trim()}` : ""
-            }`,
-          ),
-        );
-      }
-    });
-
+    this.child = child;
+    this.stderrBuffer = "";
+    this.output = createInterface({ input: child.stdout });
+    this.output.on("line", (line) => this.handleLine(line));
     child.stderr.on("data", (chunk: Buffer) => {
-      stderrBuffer += chunk.toString("utf8");
-      if (stderrBuffer.length > 8_000) stderrBuffer = stderrBuffer.slice(-8_000);
+      this.stderrBuffer += chunk.toString("utf8");
+      if (this.stderrBuffer.length > 8_000) this.stderrBuffer = this.stderrBuffer.slice(-8_000);
+    });
+    child.on("error", (error) => this.fail(error));
+    child.on("exit", (code, maybeSignal) => {
+      if (!this.closed && this.child === child) {
+        this.fail(new Error(
+          `Codex app-server exited early (${maybeSignal ?? `code ${code}`})${
+            this.stderrBuffer.trim() ? `: ${this.stderrBuffer.trim()}` : ""
+          }`,
+        ));
+      }
+      if (this.child === child) this.child = undefined;
     });
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdoutBuffer += chunk.toString("utf8");
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let message: CodexAppServerMessage;
-        try {
-          message = JSON.parse(line) as CodexAppServerMessage;
-        } catch {
-          continue;
-        }
-        handleMessage(message);
-      }
-    });
-
-    const send = (message: JsonObject) => {
-      child.stdin.write(`${JSON.stringify(message)}\n`);
-    };
-
-    const handleMessage = (message: CodexAppServerMessage) => {
-      if (message.id === 1) {
-        if (message.error) {
-          finish(new Error(message.error.message ?? "Codex app-server initialize failed"));
-          return;
-        }
-        send({ method: "initialized", params: {} });
-        send({ method: "account/read", id: 2, params: { refreshToken: false } });
-        send({ method: "account/rateLimits/read", id: 3 });
-        return;
-      }
-
-      if (message.id === 2) {
-        account = message.result;
-        return;
-      }
-
-      if (message.id === 3) {
-        if (message.error) {
-          const details = stderrBuffer.trim();
-          finish(new Error(`${message.error.message ?? "Codex rate-limit request failed"}${details ? `\n${details}` : ""}`));
-          return;
-        }
-        finish(undefined, { account, response: asObject(message.result) });
-      }
-    };
-
-    send({
-      method: "initialize",
-      id: 1,
-      params: {
-        clientInfo: {
-          name: "pi_codex_usage",
-          title: "pi Codex Usage",
-          version: EXTENSION_VERSION,
-        },
-        capabilities: {
-          optOutNotificationMethods: ["remoteControl/status/changed"],
-        },
+    this.initPromise = this.request("initialize", {
+      clientInfo: {
+        name: "pi_codex_usage",
+        title: "pi Codex Usage",
+        version: EXTENSION_VERSION,
       },
+      capabilities: {
+        optOutNotificationMethods: ["remoteControl/status/changed"],
+      },
+    }, signal).then(() => {
+      this.send({ method: "initialized", params: {} });
+    }).catch((error) => {
+      this.fail(error instanceof Error ? error : new Error(String(error)));
+      throw error;
     });
-  });
+
+    return this.initPromise;
+  }
+
+  private request(method: string, params: JsonObject, signal?: AbortSignal): Promise<unknown> {
+    const child = this.child;
+    if (!child || this.closed) return Promise.reject(new Error("Codex app-server is not running"));
+    if (signal?.aborted) return Promise.reject(new Error("Cancelled"));
+
+    const id = this.nextRequestId++;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const request = this.pending.get(id);
+        if (!request) return;
+        this.pending.delete(id);
+        request.removeAbortListener?.();
+        reject(new Error(`Timed out after ${APP_SERVER_TIMEOUT_MS / 1000}s waiting for ${method}`));
+      }, APP_SERVER_TIMEOUT_MS);
+      const pending: PendingRequest = { resolve, reject, timeout };
+
+      if (signal) {
+        const onAbort = () => {
+          if (!this.pending.delete(id)) return;
+          clearTimeout(timeout);
+          reject(new Error("Cancelled"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        pending.removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      }
+
+      this.pending.set(id, pending);
+      try {
+        this.send({ method, id, params });
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timeout);
+        pending.removeAbortListener?.();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  private send(message: JsonObject): void {
+    if (!this.child || this.child.stdin.destroyed) throw new Error("Codex app-server stdin is closed");
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  private handleLine(line: string): void {
+    if (!line.trim()) return;
+    try {
+      const message = JSON.parse(line) as CodexAppServerMessage;
+      if (typeof message.id !== "number") return;
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      clearTimeout(pending.timeout);
+      pending.removeAbortListener?.();
+      if (message.error) {
+        pending.reject(new Error(message.error.message ?? "Codex app-server request failed"));
+      } else {
+        pending.resolve(message.result);
+      }
+    } catch {
+      // Ignore non-JSON output; the app-server protocol is line-delimited JSON.
+    }
+  }
+
+  private fail(error: Error): void {
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timeout);
+      request.removeAbortListener?.();
+      request.reject(error);
+    }
+    this.pending.clear();
+    this.initPromise = undefined;
+    this.output?.close();
+    this.output = undefined;
+    if (this.child) {
+      this.child.kill();
+      this.child = undefined;
+    }
+  }
 }
 
 function summarizeUsage(raw: CodexUsageRaw): UsageSummary {
@@ -310,8 +398,18 @@ function summarizeUsage(raw: CodexUsageRaw): UsageSummary {
 
     const primary = asObject(snapshot.primary);
     const secondary = asObject(snapshot.secondary);
-    const primaryWindow = primary ? makeWindow(`${prefix}${durationLabel(numberValue(primary.windowDurationMins ?? primary.window_minutes), "5h")} limit`, primary, limitName) : undefined;
-    const secondaryWindow = secondary ? makeWindow(`${prefix}${durationLabel(numberValue(secondary.windowDurationMins ?? secondary.window_minutes), "weekly")} limit`, secondary, limitName) : undefined;
+    const primaryWindow = primary
+      ? makeWindow(
+          `${prefix}${durationLabel(numberValue(primary.windowDurationMins ?? primary.window_minutes), "5h")} limit`,
+          primary,
+        )
+      : undefined;
+    const secondaryWindow = secondary
+      ? makeWindow(
+          `${prefix}${durationLabel(numberValue(secondary.windowDurationMins ?? secondary.window_minutes), "weekly")} limit`,
+          secondary,
+        )
+      : undefined;
     if (primaryWindow) windows.push(primaryWindow);
     if (secondaryWindow) windows.push(secondaryWindow);
 
@@ -383,7 +481,7 @@ function collectSnapshots(response: JsonObject): JsonObject[] {
   return single ? [single] : [];
 }
 
-function makeWindow(label: string, window: JsonObject, limitName?: string): UsageWindow | undefined {
+function makeWindow(label: string, window: JsonObject): UsageWindow | undefined {
   const used = numberValue(window.usedPercent ?? window.used_percent);
   if (used === undefined) return undefined;
   const usedPercent = clamp(used, 0, 100);
@@ -392,7 +490,6 @@ function makeWindow(label: string, window: JsonObject, limitName?: string): Usag
   const windowMinutes = numberValue(window.windowDurationMins ?? window.window_minutes);
   return {
     label: capitalizeLabel(label),
-    limitName,
     usedPercent,
     remainingPercent,
     resetsAt,
@@ -410,11 +507,27 @@ function formatWindowLine(window: UsageWindow, labelWidth: number): string {
 
 function compactStatus(windows: UsageWindow[], credits?: string): string {
   if (windows.length === 0) return credits ? `Codex usage: ${credits}` : "Codex usage: n/a";
-  const primary = windows[0];
-  const weekly = windows.find((window) => /week/i.test(window.label)) ?? windows[1];
-  const parts = [`5h ${primary.usedPercent.toFixed(0)}% used`];
-  if (weekly) parts.push(`wk ${weekly.usedPercent.toFixed(0)}% used`);
+
+  // The API has changed which window is primary over time. Use the duration
+  // instead of assuming the first window is always the 5-hour limit.
+  const short = windows.find((window) => (window.windowMinutes ?? Infinity) < 10_000);
+  const weekly = windows.find(
+    (window) => (window.windowMinutes ?? 0) >= 10_000 || /week/i.test(window.label),
+  );
+  const parts: string[] = [];
+  if (short) parts.push(`${compactWindowLabel(short)} ${short.usedPercent.toFixed(0)}% used`);
+  if (weekly && weekly !== short) parts.push(`wk ${weekly.usedPercent.toFixed(0)}% used`);
+  if (parts.length === 0) {
+    const first = windows[0];
+    parts.push(`${compactWindowLabel(first)} ${first.usedPercent.toFixed(0)}% used`);
+  }
   return `Codex ${parts.join(" · ")}`;
+}
+
+function compactWindowLabel(window: UsageWindow): string {
+  if (window.windowMinutes === 300) return "5h";
+  if (window.windowMinutes !== undefined && window.windowMinutes >= 10_000) return "wk";
+  return window.label.replace(/\s+limit$/i, "");
 }
 
 function durationLabel(minutes: number | undefined, fallback: string): string {
@@ -493,7 +606,7 @@ function relativeTime(deltaMs: number): string {
   const suffix = deltaMs >= 0 ? "from now" : "ago";
   const minutes = Math.round(abs / 60_000);
   if (minutes < 1) return "now";
-  if (minutes < 60) return `in ${minutes}m`.replace("in ", deltaMs >= 0 ? "in " : "") + (deltaMs >= 0 ? "" : ` ${suffix}`);
+  if (minutes < 60) return `${deltaMs >= 0 ? "in " : ""}${minutes}m${deltaMs >= 0 ? "" : ` ${suffix}`}`;
   const hours = Math.floor(minutes / 60);
   const mins = minutes % 60;
   if (hours < 48) return `${deltaMs >= 0 ? "in " : ""}${hours}h${mins ? ` ${mins}m` : ""}${deltaMs >= 0 ? "" : ` ${suffix}`}`;

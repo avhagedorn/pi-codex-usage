@@ -71,7 +71,7 @@ Reload or restart pi after installing:
 /codex-usage help     # show command help
 ```
 
-By default the extension is hidden: it does not show a footer item or widget until you ask for usage. The status view refreshes every 60 seconds and is cleared when you start your next prompt or run `/codex-usage hide`.
+By default the extension is hidden: it does not show a footer item or widget until you ask for usage. The widget is cleared when you start your next prompt; the status view remains visible and refreshes every 60 seconds until you run `/codex-usage hide`.
 
 ## Agent tool
 

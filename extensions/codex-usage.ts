@@ -36,7 +36,7 @@ type UsageSummary = {
   plan?: string;
 };
 
-const EXTENSION_VERSION = "0.3.0";
+const EXTENSION_VERSION = "0.3.1";
 const STATUS_KEY = "codex-usage";
 const WIDGET_KEY = "codex-usage";
 const STATUS_REFRESH_INTERVAL_MS = 60_000;
@@ -53,7 +53,8 @@ let appServer: CodexAppServerClient | undefined;
 let cachedSummary: UsageSummary | undefined;
 let refreshInFlight: Promise<UsageSummary> | undefined;
 let statusAutoRefreshTimer: NodeJS.Timeout | undefined;
-let uiRequestId = 0;
+let statusRequestId = 0;
+let widgetRequestId = 0;
 
 type RefreshView = "widget" | "status";
 
@@ -80,8 +81,9 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const requestId = ++uiRequestId;
       const view: RefreshView = action === "status" ? "status" : "widget";
+      const requestId =
+        view === "status" ? ++statusRequestId : ++widgetRequestId;
       const cached = cachedSummary;
 
       if (view === "status") {
@@ -130,7 +132,8 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     cachedSummary = undefined;
     refreshInFlight = undefined;
-    uiRequestId = 0;
+    statusRequestId = 0;
+    widgetRequestId = 0;
     appServer = ctx.hasUI ? new CodexAppServerClient() : undefined;
     if (ctx.hasUI) clearUsageUi(ctx);
 
@@ -141,13 +144,14 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
   });
 
   pi.on("input", (_event, ctx) => {
-    // Usage is a transient view: clear it when the user starts the next prompt.
-    // Bump the request id so an older refresh cannot put the widget back.
-    if (ctx.hasUI) clearUsageUi(ctx);
+    // The widget is transient, but the footer status remains visible and keeps
+    // refreshing until the user explicitly hides it.
+    if (ctx.hasUI) clearWidgetUi(ctx);
   });
 
   pi.on("session_shutdown", () => {
-    uiRequestId++;
+    statusRequestId++;
+    widgetRequestId++;
     stopStatusAutoRefresh();
     appServer?.close();
     appServer = undefined;
@@ -169,11 +173,16 @@ function showHelp(ctx: ExtensionContext) {
 }
 
 function clearUsageUi(ctx: ExtensionContext) {
-  uiRequestId++;
+  statusRequestId++;
   stopStatusAutoRefresh();
+  clearWidgetUi(ctx);
   if (!ctx.hasUI) return;
   ctx.ui.setStatus(STATUS_KEY, undefined);
-  ctx.ui.setWidget(WIDGET_KEY, undefined);
+}
+
+function clearWidgetUi(ctx: ExtensionContext) {
+  widgetRequestId++;
+  if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
 }
 
 function startStatusAutoRefresh(ctx: ExtensionContext, requestId: number) {
@@ -181,7 +190,7 @@ function startStatusAutoRefresh(ctx: ExtensionContext, requestId: number) {
   if (!ctx.hasUI) return;
 
   statusAutoRefreshTimer = setInterval(() => {
-    if (requestId !== uiRequestId) {
+    if (requestId !== statusRequestId) {
       stopStatusAutoRefresh();
       return;
     }
@@ -207,7 +216,11 @@ async function refreshAndRender(
 ): Promise<UsageSummary> {
   const summary = await refreshUsage(ctx.signal).catch((error) => {
     const message = friendlyError(error);
-    if (ctx.hasUI && options.requestId === uiRequestId) {
+    const isCurrentRequest =
+      options.view === "status"
+        ? options.requestId === statusRequestId
+        : options.requestId === widgetRequestId;
+    if (ctx.hasUI && isCurrentRequest) {
       if (options.view === "status") {
         ctx.ui.setStatus(STATUS_KEY, "Codex usage: unavailable");
         if (options.notify) ctx.ui.notify(message, "error");
@@ -223,7 +236,11 @@ async function refreshAndRender(
     throw error;
   });
 
-  if (ctx.hasUI && options.requestId === uiRequestId) {
+  const isCurrentRequest =
+    options.view === "status"
+      ? options.requestId === statusRequestId
+      : options.requestId === widgetRequestId;
+  if (ctx.hasUI && isCurrentRequest) {
     if (options.view === "status") {
       ctx.ui.setStatus(STATUS_KEY, summary.statusText);
       if (options.notify) ctx.ui.notify("Codex usage updated", "info");

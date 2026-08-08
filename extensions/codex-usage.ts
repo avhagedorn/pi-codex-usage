@@ -36,7 +36,7 @@ type UsageSummary = {
   plan?: string;
 };
 
-const EXTENSION_VERSION = "0.3.1";
+const EXTENSION_VERSION = "0.3.4";
 const STATUS_KEY = "codex-usage";
 const WIDGET_KEY = "codex-usage";
 const STATUS_PREFERENCE_ENTRY = "codex-usage-preferences";

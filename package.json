@@ -1,6 +1,6 @@
 {
   "name": "pi-codex-usage",
-  "version": "0.3.1",
+  "version": "0.3.4",
   "description": "A Codex usage extension for pi: shows ChatGPT Codex subscription usage, remaining limits, credits, and reset times.",
   "type": "module",
   "license": "MIT",

@@ -39,6 +39,7 @@ type UsageSummary = {
 const EXTENSION_VERSION = "0.3.1";
 const STATUS_KEY = "codex-usage";
 const WIDGET_KEY = "codex-usage";
+const STATUS_PREFERENCE_ENTRY = "codex-usage-preferences";
 const STATUS_REFRESH_INTERVAL_MS = 60_000;
 const APP_SERVER_TIMEOUT_MS = 20_000;
 
@@ -53,17 +54,22 @@ let appServer: CodexAppServerClient | undefined;
 let cachedSummary: UsageSummary | undefined;
 let refreshInFlight: Promise<UsageSummary> | undefined;
 let statusAutoRefreshTimer: NodeJS.Timeout | undefined;
+let persistentStatusEnabled = false;
 let statusRequestId = 0;
 let widgetRequestId = 0;
 
 type RefreshView = "widget" | "status";
+
+type UsagePreferences = {
+  persistentStatus?: boolean;
+};
 
 export default function codexUsageExtension(pi: ExtensionAPI) {
   pi.registerCommand("codex-usage", {
     description:
       "Show Codex ChatGPT subscription usage windows, remaining percentage, credits, and reset times",
     getArgumentCompletions(prefix: string) {
-      return ["refresh", "status", "hide", "help"]
+      return ["status", "help"]
         .filter((value) => value.startsWith(prefix.trim().toLowerCase()))
         .map((value) => ({ value, label: value }));
     },
@@ -75,20 +81,16 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
         return;
       }
 
-      if (["hide", "clear", "off"].includes(action)) {
-        clearUsageUi(ctx);
-        if (ctx.hasUI) ctx.ui.notify("Codex usage display hidden", "info");
-        return;
-      }
-
       const view: RefreshView = action === "status" ? "status" : "widget";
       const requestId =
         view === "status" ? ++statusRequestId : ++widgetRequestId;
       const cached = cachedSummary;
 
       if (view === "status") {
+        persistentStatusEnabled = true;
+        pi.appendEntry(STATUS_PREFERENCE_ENTRY, { persistentStatus: true });
         startStatusAutoRefresh(ctx, requestId);
-      } else {
+      } else if (!persistentStatusEnabled) {
         stopStatusAutoRefresh();
       }
 
@@ -132,20 +134,33 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     cachedSummary = undefined;
     refreshInFlight = undefined;
+    persistentStatusEnabled = readPersistentStatus(ctx);
     statusRequestId = 0;
     widgetRequestId = 0;
     appServer = ctx.hasUI ? new CodexAppServerClient() : undefined;
-    if (ctx.hasUI) clearUsageUi(ctx);
-
-    // Warm the persistent app-server connection in the background. The first
-    // command is then normally served from the cache instead of waiting for
-    // process startup and the rate-limits request.
-    if (ctx.hasUI) void refreshUsage().catch(() => undefined);
+    if (ctx.hasUI) {
+      clearUsageUi(ctx);
+      if (persistentStatusEnabled) {
+        const requestId = ++statusRequestId;
+        startStatusAutoRefresh(ctx, requestId);
+        ctx.ui.setStatus(STATUS_KEY, "Codex usage: refreshing…");
+        void refreshAndRender(ctx, {
+          view: "status",
+          requestId,
+          notify: false,
+        }).catch(() => undefined);
+      } else {
+        // Warm the persistent app-server connection in the background. The first
+        // command is then normally served from the cache instead of waiting for
+        // process startup and the rate-limits request.
+        void refreshUsage().catch(() => undefined);
+      }
+    }
   });
 
   pi.on("input", (_event, ctx) => {
     // The widget is transient, but the footer status remains visible and keeps
-    // refreshing until the user explicitly hides it.
+    // refreshing once persistent status has been enabled.
     if (ctx.hasUI) clearWidgetUi(ctx);
   });
 
@@ -164,12 +179,22 @@ function showHelp(ctx: ExtensionContext) {
   ctx.ui.setWidget(WIDGET_KEY, [
     "Codex usage commands",
     "  /codex-usage          refresh and show usage above the editor",
-    "  /codex-usage status   refresh footer status every 60 seconds",
-    "  /codex-usage hide     clear footer/widget status",
+    "  /codex-usage status   enable persistent footer status (refreshes every 60s)",
     "",
     "Uses `codex app-server --listen stdio://` and `account/rateLimits/read`.",
     "If auth is expired, run `codex login` and retry.",
   ]);
+}
+
+function readPersistentStatus(ctx: ExtensionContext): boolean {
+  let enabled = false;
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (entry.type !== "custom" || entry.customType !== STATUS_PREFERENCE_ENTRY) {
+      continue;
+    }
+    enabled = (entry.data as UsagePreferences | undefined)?.persistentStatus === true;
+  }
+  return enabled;
 }
 
 function clearUsageUi(ctx: ExtensionContext) {

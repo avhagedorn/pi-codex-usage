@@ -7,7 +7,7 @@ What it does:
 - Shows your current ChatGPT Codex usage windows from the local Codex CLI app-server.
 - Shows a compact usage card above the editor with used/left percentages, reset times, plan, credits, and banked resets.
 - Keeps itself hidden by default; the usage card disappears automatically when you send your next prompt.
-- Can update a compact footer status on demand and refresh it automatically every 60 seconds.
+- Can enable a persistent compact footer status that refreshes automatically every 60 seconds.
 - Registers a `codex_usage` tool so the agent can answer usage-limit questions directly.
 
 Example output:
@@ -66,12 +66,11 @@ Reload or restart pi after installing:
 
 ```text
 /codex-usage          # fetch usage and show the card above the editor
-/codex-usage status   # fetch usage and auto-refresh compact footer status every 60s
-/codex-usage hide     # clear footer/widget leftovers
+/codex-usage status   # enable persistent footer status, refreshed every 60s
 /codex-usage help     # show command help
 ```
 
-By default the extension is hidden: it does not show a footer item or widget until you ask for usage. The widget is cleared when you start your next prompt; the status view remains visible and refreshes every 60 seconds until you run `/codex-usage hide`.
+By default the extension is hidden: it does not show a footer item or widget until you ask for usage. `/codex-usage` shows the popup widget, while `/codex-usage status` enables the footer status persistently for the current session, including when that session is reopened or Pi is reloaded.
 
 ## Agent tool
 

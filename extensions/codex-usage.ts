@@ -36,9 +36,10 @@ type UsageSummary = {
   plan?: string;
 };
 
-const EXTENSION_VERSION = "0.2.0";
+const EXTENSION_VERSION = "0.3.0";
 const STATUS_KEY = "codex-usage";
 const WIDGET_KEY = "codex-usage";
+const STATUS_REFRESH_INTERVAL_MS = 60_000;
 const APP_SERVER_TIMEOUT_MS = 20_000;
 
 type PendingRequest = {
@@ -51,6 +52,7 @@ type PendingRequest = {
 let appServer: CodexAppServerClient | undefined;
 let cachedSummary: UsageSummary | undefined;
 let refreshInFlight: Promise<UsageSummary> | undefined;
+let statusAutoRefreshTimer: NodeJS.Timeout | undefined;
 let uiRequestId = 0;
 
 type RefreshView = "widget" | "status";
@@ -82,6 +84,12 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
       const view: RefreshView = action === "status" ? "status" : "widget";
       const cached = cachedSummary;
 
+      if (view === "status") {
+        startStatusAutoRefresh(ctx, requestId);
+      } else {
+        stopStatusAutoRefresh();
+      }
+
       if (ctx.hasUI) {
         if (view === "widget") {
           ctx.ui.setWidget(WIDGET_KEY, cached?.widgetLines ?? [
@@ -95,7 +103,7 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
 
       // Render the cached value immediately, then replace it when the refresh
       // completes. The command no longer waits for app-server startup/network I/O.
-      void refreshAndRender(ctx, { view, requestId }).catch(() => undefined);
+      void refreshAndRender(ctx, { view, requestId, notify: true }).catch(() => undefined);
     },
   });
 
@@ -140,6 +148,7 @@ export default function codexUsageExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     uiRequestId++;
+    stopStatusAutoRefresh();
     appServer?.close();
     appServer = undefined;
     refreshInFlight = undefined;
@@ -151,7 +160,7 @@ function showHelp(ctx: ExtensionContext) {
   ctx.ui.setWidget(WIDGET_KEY, [
     "Codex usage commands",
     "  /codex-usage          refresh and show usage above the editor",
-    "  /codex-usage status   refresh compact footer status only",
+    "  /codex-usage status   refresh footer status every 60 seconds",
     "  /codex-usage hide     clear footer/widget status",
     "",
     "Uses `codex app-server --listen stdio://` and `account/rateLimits/read`.",
@@ -161,21 +170,47 @@ function showHelp(ctx: ExtensionContext) {
 
 function clearUsageUi(ctx: ExtensionContext) {
   uiRequestId++;
+  stopStatusAutoRefresh();
   if (!ctx.hasUI) return;
   ctx.ui.setStatus(STATUS_KEY, undefined);
   ctx.ui.setWidget(WIDGET_KEY, undefined);
 }
 
+function startStatusAutoRefresh(ctx: ExtensionContext, requestId: number) {
+  stopStatusAutoRefresh();
+  if (!ctx.hasUI) return;
+
+  statusAutoRefreshTimer = setInterval(() => {
+    if (requestId !== uiRequestId) {
+      stopStatusAutoRefresh();
+      return;
+    }
+
+    void refreshAndRender(ctx, {
+      view: "status",
+      requestId,
+      notify: false,
+    }).catch(() => undefined);
+  }, STATUS_REFRESH_INTERVAL_MS);
+}
+
+function stopStatusAutoRefresh() {
+  if (statusAutoRefreshTimer) {
+    clearInterval(statusAutoRefreshTimer);
+    statusAutoRefreshTimer = undefined;
+  }
+}
+
 async function refreshAndRender(
   ctx: ExtensionContext,
-  options: { view: RefreshView; requestId: number },
+  options: { view: RefreshView; requestId: number; notify: boolean },
 ): Promise<UsageSummary> {
   const summary = await refreshUsage(ctx.signal).catch((error) => {
     const message = friendlyError(error);
     if (ctx.hasUI && options.requestId === uiRequestId) {
       if (options.view === "status") {
         ctx.ui.setStatus(STATUS_KEY, "Codex usage: unavailable");
-        ctx.ui.notify(message, "error");
+        if (options.notify) ctx.ui.notify(message, "error");
       } else {
         ctx.ui.setWidget(WIDGET_KEY, [
           "Codex usage unavailable",
@@ -191,7 +226,7 @@ async function refreshAndRender(
   if (ctx.hasUI && options.requestId === uiRequestId) {
     if (options.view === "status") {
       ctx.ui.setStatus(STATUS_KEY, summary.statusText);
-      ctx.ui.notify("Codex usage updated", "info");
+      if (options.notify) ctx.ui.notify("Codex usage updated", "info");
     } else {
       ctx.ui.setWidget(WIDGET_KEY, summary.widgetLines);
     }
